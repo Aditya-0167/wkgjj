@@ -1,0 +1,123 @@
+name: manifest-poc
+# marker: v1
+
+# Manual trigger: Actions tab -> manifest-poc -> Run workflow.
+# Also runs automatically on push, for convenience.
+#
+# Reproduces OE1107240405872 ("Manifest/index content not verified against
+# digest during OCI image pull") against a real macOS/Swift build, using the
+# actual project code (RegistryClient.fetch, ImageStore.pull) -- not a
+# logic-only mirror. This directly answers Apple's stated reason for
+# needing more information: "The included script does not call the
+# affected code; it represents the absence of a check rather than testing
+# the real code path."
+#
+# Unlike the ext4 PoC, success here means the program runs to completion
+# WITHOUT throwing a digest-mismatch error -- this is a logic/verification
+# gap, not a memory-safety crash.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  reproduce:
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+          python3 --version
+
+      - name: Build harness
+        run: swift build
+
+      - name: Start mock malicious registry
+        run: |
+          # -u = unbuffered stdout/stderr, so print() output reaches the
+          # redirected file immediately instead of sitting in a buffer.
+          python3 -u mock_registry.py 0 > mock_registry_startup.log 2>&1 &
+          MOCK_PID=$!
+          echo $MOCK_PID > mock_registry.pid
+          echo "Started mock_registry.py with PID $MOCK_PID"
+
+          # Wait for the server to print its assigned port and digests.
+          FOUND=0
+          for i in $(seq 1 40); do
+            if grep -q "MOCK_REGISTRY_PORT=" mock_registry_startup.log 2>/dev/null; then
+              FOUND=1
+              break
+            fi
+            if ! kill -0 "$MOCK_PID" 2>/dev/null; then
+              echo "Process $MOCK_PID is no longer running (exited early)."
+              break
+            fi
+            sleep 0.25
+          done
+
+          echo "=== mock_registry_startup.log ==="
+          cat mock_registry_startup.log || echo "(cat failed)"
+          echo "=== process status ==="
+          ps -p "$MOCK_PID" || echo "(process not found)"
+          echo "=== end diagnostics ==="
+
+          if [ "$FOUND" -ne 1 ]; then
+            echo "FAILED: never saw MOCK_REGISTRY_PORT= in the log within the wait window."
+            exit 1
+          fi
+
+      - name: Run PoC against the mock registry
+        run: |
+          PORT=$(grep "MOCK_REGISTRY_PORT=" mock_registry_startup.log | cut -d= -f2)
+          DIGEST=$(grep "^EXPECTED_DIGEST=" mock_registry_startup.log | cut -d= -f2)
+          echo "Using PORT=$PORT DIGEST=$DIGEST"
+
+          LOG="poc-results.log"
+          : > "$LOG"
+          {
+            echo "## manifest-poc results"
+            echo
+            echo '```'
+          } | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
+
+          set +e
+          output=$(.build/debug/manifest-poc "$PORT" "$DIGEST" 2>&1)
+          status=$?
+          set -e
+
+          echo "$output" | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
+          echo | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
+          echo "exit status: $status" | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Also dump the registry's own request log for cross-reference.
+          {
+            echo
+            echo "## mock registry request log"
+            echo
+            echo '```'
+            cat mock_registry_startup.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit 0
+
+      - name: Stop mock registry
+        if: always()
+        run: |
+          if [ -f mock_registry.pid ]; then
+            kill "$(cat mock_registry.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload full log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-poc-macos-log
+          path: poc-results.log
